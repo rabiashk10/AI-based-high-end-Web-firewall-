@@ -1,0 +1,594 @@
+"""
+WAF Interceptor Middleware
+Author: Person 1 (Traffic Interceptor & Feature Extraction)
+Integrated: Person 2 (Database) + Person 3 (ML Models)
+Purpose: Intercepts all incoming HTTP requests and applies WAF protection
+
+This middleware:
+1. Captures every HTTP request before it reaches the application
+2. Extracts features from the request
+3. Calls ML models for threat prediction
+4. Blocks malicious requests or allows benign ones
+5. Logs everything to database
+"""
+
+from flask import request, jsonify, g
+from functools import wraps
+import time
+from datetime import datetime
+import traceback
+from urllib.parse import parse_qs
+
+# Import feature extraction
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils.feature_extraction import FeatureExtractor
+
+# ============================================================================
+# PERSON 2's DATABASE INTEGRATION
+# ============================================================================
+try:
+    from database.db_operations import DatabaseOperations
+    db_ops = DatabaseOperations()
+    print("✅ Database operations loaded successfully")
+    DB_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️  Database not available: {e}")
+    print("   WAF will run without database logging")
+    DB_AVAILABLE = False
+    db_ops = None
+
+
+# ============================================================================
+# PERSON 3's ML MODELS INTEGRATION
+# ============================================================================
+try:
+    from models.ml_model import MLModel
+    from models.anomaly_detector import AnomalyDetector
+    
+    print("🤖 Initializing AI-WAF ML Models...")
+    
+    # Initialize Random Forest Classifier
+    ml_classifier = MLModel()
+    ml_loaded = ml_classifier.load_model()
+    
+    # Initialize Isolation Forest Anomaly Detector
+    anomaly_detector = AnomalyDetector()
+    anomaly_loaded = anomaly_detector.load_model()
+    
+    if ml_loaded and anomaly_loaded:
+        print("✅ Random Forest Classifier loaded successfully")
+        print("✅ Isolation Forest Anomaly Detector loaded successfully")
+        ML_AVAILABLE = True
+    elif ml_loaded:
+        print("✅ Random Forest Classifier loaded successfully")
+        print("⚠️  Isolation Forest not available - using classifier only")
+        ML_AVAILABLE = True
+    else:
+        print("⚠️  ML models not loaded - falling back to rule-based detection")
+        ML_AVAILABLE = False
+        
+except Exception as e:
+    print(f"⚠️  ML models not available: {e}")
+    print("   Falling back to rule-based detection")
+    ML_AVAILABLE = False
+    ml_classifier = None
+    anomaly_detector = None
+    anomaly_loaded = False
+
+
+class WAFInterceptor:
+    """
+    Main WAF Interceptor Class
+    Handles all request interception and threat detection logic
+    Now powered by ML models and database!
+    """
+    
+    def __init__(self, threshold=0.7):
+        """
+        Initialize WAF Interceptor
+        
+        Args:
+            threshold (float): Threat score threshold for blocking (default: 0.7)
+        """
+        self.threshold = threshold
+        self.feature_extractor = FeatureExtractor()
+        self.blocked_count = 0
+        self.allowed_count = 0
+        self.ml_available = ML_AVAILABLE
+        self.db_available = DB_AVAILABLE
+
+    def extract_request_data(self, req):
+        """
+        Extract all relevant data from Flask request object
+        
+        Args:
+            req: Flask request object
+            
+        Returns:
+            dict: Extracted request data
+        """
+        # Get client IP address (handles proxy scenarios)
+        if req.headers.get('X-Forwarded-For'):
+            ip_address = req.headers.get('X-Forwarded-For').split(',')[0].strip()
+        else:
+            ip_address = req.remote_addr or '0.0.0.0'
+        
+        # Extract request data
+        request_data = {
+            'ip_address': ip_address,
+            'method': req.method,
+            'url': req.url,
+            'path': req.path,
+            'query_string': req.query_string.decode('utf-8', errors='ignore'),
+            'headers': dict(req.headers),
+            'body': req.get_data(as_text=True),
+            'content_type': req.content_type or '',
+            'user_agent': req.headers.get('User-Agent', ''),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return request_data
+    
+    def check_whitelist_blacklist(self, ip_address):
+        """
+        Check if IP is in whitelist or blacklist
+        
+        Args:
+            ip_address (str): Client IP address
+            
+        Returns:
+            tuple: (should_block, reason)
+        """
+        if not self.db_available:
+            # Fallback: localhost is whitelisted
+            if ip_address in ['127.0.0.1', 'localhost', '::1']:
+                return False, "Whitelisted IP (default)"
+            return None, None
+        
+        try:
+            # Check whitelist first (highest priority)
+            if db_ops.check_whitelist(ip_address):
+                return False, "Whitelisted IP"
+            
+            # Check blacklist
+            if db_ops.check_blacklist(ip_address):
+                return True, "Blacklisted IP"
+            
+            return None, None
+            
+        except Exception as e:
+            print(f"[ERROR] Whitelist/Blacklist check failed: {e}")
+            return None, None
+    
+    def rule_based_predict(self, request_data):
+        """
+        FALLBACK: Rule-based detection when ML models are not available
+        
+        Args:
+            request_data (dict): Request data dictionary
+            
+        Returns:
+            tuple: (threat_score, attack_type)
+        """
+        try:
+            # Extract features for rule-based analysis
+            features = self.feature_extractor.extract_features(request_data)
+            
+            # Enhanced SQL injection detection
+            sql_combined_count = features[6]  # Combined keywords + patterns
+            query_string = request_data.get('query_string', '')
+            
+            # XSS detection (check first - higher priority)
+            if features[8] > 0:  # xss_keyword_count > 0
+                return 0.90, "XSS"
+            
+            # SQL injection rules (more sensitive)
+            if sql_combined_count >= 2:  # High confidence
+                return 0.95, "SQL Injection"
+            elif sql_combined_count >= 1 and self._is_suspicious_sql_context(query_string):
+                return 0.85, "SQL Injection"  # Medium confidence with context
+            elif sql_combined_count >= 1 and len(query_string) > 10:  # Single keyword in long query
+                return 0.75, "SQL Injection"
+            
+            # Other attacks
+            elif features[10] == 1:  # has_path_traversal
+                return 0.85, "Path Traversal"
+            elif features[11] == 1:  # has_command_injection
+                return 0.88, "Command Injection"
+            
+            # Additional rule-based detections
+            # 1. Suspicious User-Agent
+            user_agent = request_data.get('user_agent', '').lower()
+            suspicious_uas = ['sqlmap', 'nmap', 'burp', 'zaproxy', 'metasploit', 'acunetix', 'nessus']
+            if any(ua in user_agent for ua in suspicious_uas):
+                return 0.80, "Suspicious User-Agent"
+            
+            # 2. Unusual HTTP Method
+            method = request_data.get('method', '').upper()
+            allowed_methods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH']
+            if method not in allowed_methods:
+                return 0.75, "Unusual HTTP Method"
+            
+            # 3. Long URL or Query String
+            url = request_data.get('url', '')
+            if len(url) > 2048:  # Common limit
+                return 0.70, "Long URL"
+            if len(query_string) > 1024:
+                return 0.65, "Long Query String"
+            
+            # 4. Multiple Query Parameters (potential parameter pollution)
+            query_params = request_data.get('query_params', {})
+            if isinstance(query_params, dict) and len(query_params) > 10:
+                return 0.60, "Excessive Query Parameters"
+            
+            # 5. Suspicious Headers
+            headers = request_data.get('headers', {})
+            header_str = str(headers).lower()
+            if any(keyword in header_str for keyword in ['<script>', 'javascript:', 'onload=', 'onerror=']):
+                return 0.85, "Header Injection"
+            
+            # 6. Suspicious Body Content
+            body = request_data.get('body', '').lower()
+            if any(pattern in body for pattern in ['<script>', 'javascript:', 'eval(', 'document.cookie']):
+                return 0.90, "Body XSS"
+            
+            # 7. File Inclusion Attempts
+            path = request_data.get('path', '').lower()
+            if any(fi in path for fi in ['/etc/passwd', '/proc/self/environ', 'php://input', 'data://']):
+                return 0.88, "File Inclusion"
+            
+            # 8. Directory Traversal Variants
+            if '../' in path or '..\\' in path or '%2e%2e' in path:
+                return 0.85, "Directory Traversal"
+            
+            # 9. Command Injection in Body or Query
+            if any(cmd in (query_string + body) for cmd in [';ls', '|cat', '`whoami`', '$(uname)', '&&', '||']):
+                return 0.88, "Command Injection"
+            
+            # 10. Rate Limiting Indicator (though not full rate limiting, flag rapid requests)
+            # This would need session tracking, but for now, check if IP has many requests (placeholder)
+            # Assuming we have a simple counter, but since it's per request, skip for now
+            
+            else:
+                return 0.15, "Benign"
+        except Exception as e:
+            print(f"[ERROR] Rule-based prediction failed: {e}")
+            return 0.15, "Benign"
+    
+    def _is_suspicious_sql_context(self, query_string):
+        """
+        Check if SQL keywords appear in suspicious contexts
+        
+        Args:
+            query_string (str): Query string to analyze
+            
+        Returns:
+            bool: True if context is suspicious
+        """
+        if not query_string:
+            return False
+            
+        # Check for SQL keywords in query parameters with quotes/equals
+        suspicious_indicators = [
+            '\'', '"', '=', ' or ', ' and ', '--', '/*', '*/'
+        ]
+        
+        sql_keywords_in_query = ['or', 'and', 'select', 'union', 'insert', 'update', 'delete']
+        
+        for keyword in sql_keywords_in_query:
+            if keyword in query_string.lower():
+                # Check if keyword appears with suspicious characters
+                for indicator in suspicious_indicators:
+                    if indicator in query_string:
+                        return True
+        
+        return False
+    
+    def ml_predict(self, request_data):
+        """
+        ML-based prediction using Person 3's trained models
+        
+        Args:
+            request_data (dict): Request data dictionary
+            
+        Returns:
+            tuple: (threat_score, attack_type)
+        """
+        if not self.ml_available or ml_classifier is None:
+            # Fallback to rule-based
+            return self.rule_based_predict(request_data)
+        
+        try:
+            # Get Random Forest prediction
+            rf_result = ml_classifier.predict(request_data)
+            
+            # Check if prediction succeeded
+            if rf_result.get('error'):
+                print(f"[WARNING] ML prediction error: {rf_result['error']}")
+                return self.rule_based_predict(request_data)
+            
+            # Get Anomaly Detection prediction (if available)
+            if anomaly_detector and anomaly_loaded:
+                try:
+                    anomaly_result = anomaly_detector.predict_anomaly(request_data)
+                    
+                    # Combine both predictions
+                    rf_score = rf_result['attack_probability']
+                    anomaly_score = abs(anomaly_result.get('anomaly_score', 0.0))
+                    
+                    # Use maximum threat score
+                    threat_score = max(rf_score, min(anomaly_score, 1.0))
+                    
+                    # Determine attack type
+                    if rf_result['is_attack']:
+                        attack_type = rf_result['prediction']
+                    elif anomaly_result.get('is_anomaly'):
+                        attack_type = f"Anomaly ({anomaly_result['severity']})"
+                    else:
+                        attack_type = "Benign"
+                    
+                    return float(threat_score), attack_type
+                    
+                except Exception as e:
+                    print(f"[WARNING] Anomaly detection failed: {e}")
+                    # Continue with Random Forest only
+            
+            # Only Random Forest available
+            threat_score = rf_result['attack_probability']
+            attack_type = rf_result['prediction'] if rf_result['is_attack'] else 'Benign'
+            
+            return float(threat_score), attack_type
+            
+        except Exception as e:
+            print(f"[ERROR] ML prediction failed: {e}")
+            traceback.print_exc()
+            # Fallback to rule-based
+            return self.rule_based_predict(request_data)
+    
+    def analyze_request(self, request_data):
+        """
+        Main analysis function: Extract features and get ML prediction
+        
+        Args:
+            request_data (dict): Extracted request data
+            
+        Returns:
+            dict: Analysis results with threat score and attack type
+        """
+        try:
+            # Step 1: Extract 20 features
+            features = self.feature_extractor.extract_features(request_data)
+            
+            # Step 2: Get prediction (ML or rule-based)
+            threat_score, attack_type = self.ml_predict(request_data)
+            
+            # Step 3: Prepare analysis result
+            analysis_result = {
+                'features': features,
+                'threat_score': threat_score,
+                'attack_type': attack_type,
+                'is_malicious': threat_score > self.threshold,
+                'ml_powered': self.ml_available
+            }
+            
+            return analysis_result
+            
+        except Exception as e:
+            print(f"[ERROR] Analysis failed: {str(e)}")
+            traceback.print_exc()
+            # Default to safe mode: allow but log error
+            return {
+                'features': [0] * 20,
+                'threat_score': 0.0,
+                'attack_type': 'Analysis Error',
+                'is_malicious': False,
+                'error': str(e)
+            }
+    
+    def log_request(self, request_data, analysis_result, is_blocked, response_time):
+        """
+        Log request to database
+        
+        Args:
+            request_data (dict): Original request data
+            analysis_result (dict): Analysis results
+            is_blocked (bool): Whether request was blocked
+            response_time (float): Processing time in seconds
+        """
+        if not self.db_available:
+            # Fallback: console logging
+            print(f"\n[CONSOLE LOG] Request at {request_data['timestamp']}")
+            print(f"  IP: {request_data['ip_address']}")
+            print(f"  Method: {request_data['method']} {request_data['path']}")
+            print(f"  Threat Score: {analysis_result['threat_score']:.2f}")
+            print(f"  Attack Type: {analysis_result['attack_type']}")
+            print(f"  Status: {'BLOCKED' if is_blocked else 'ALLOWED'}")
+            return None
+        
+        try:
+            # Parse query string into parameters dict
+            query_params = {}
+            if request_data.get('query_string'):
+                try:
+                    query_params = parse_qs(request_data['query_string'], keep_blank_values=True)
+                except:
+                    query_params = {}
+            
+            log_data = {
+                'ip_address': request_data['ip_address'],
+                'method': request_data['method'],
+                'url': request_data['url'],
+                'headers': request_data.get('headers', {}),
+                'body': request_data.get('body', ''),
+                'query_params': query_params,
+                'threat_score': analysis_result['threat_score'],
+                'is_blocked': is_blocked,
+                'attack_type': analysis_result['attack_type'],
+                'features': analysis_result['features'],
+                'response_time': response_time
+            }
+            
+            # Log to database
+            log_id = db_ops.log_request(log_data)
+            return log_id
+            
+        except Exception as e:
+            print(f"[ERROR] Logging failed: {str(e)}")
+            traceback.print_exc()
+            return None
+    
+    def intercept(self, req):
+        """
+        Main interception logic - called for every request
+        
+        Args:
+            req: Flask request object
+            
+        Returns:
+            Response object if blocked, None if allowed
+        """
+        start_time = time.time()
+        
+        try:
+            # Step 1: Extract request data
+            request_data = self.extract_request_data(req)
+            
+            # Step 2: Check whitelist/blacklist
+            should_block, reason = self.check_whitelist_blacklist(request_data['ip_address'])
+                  
+            if should_block is not None:
+                # IP is whitelisted or blacklisted
+                response_time = time.time() - start_time
+                
+                if should_block:
+                    self.blocked_count += 1
+                    print(f"\n[BLOCKED] {reason}: {request_data['ip_address']}")
+                    
+                    # Log to database
+                    self.log_request(
+                        request_data,
+                        {'threat_score': 1.0, 'attack_type': reason, 'features': [0]*20},
+                        True,
+                        response_time
+                    )
+                    
+                    return jsonify({
+                        'error': 'Access Denied',
+                        'message': 'Your IP address has been blacklisted',
+                        'blocked': True,
+                        'reason': reason
+                    }), 403
+                else:
+                    # Whitelisted - allow without analysis
+                    self.allowed_count += 1
+                    return None
+            
+            # Step 3: Analyze request with ML models
+            analysis_result = self.analyze_request(request_data)
+            
+            # Step 4: Make decision
+            is_blocked = analysis_result['is_malicious']
+            response_time = time.time() - start_time
+            
+            # Step 5: Log request
+            self.log_request(request_data, analysis_result, is_blocked, response_time)
+            
+            # Step 6: Block or allow
+            if is_blocked:
+                self.blocked_count += 1
+                ml_status = "🤖 AI-Powered" if self.ml_available else "📏 Rule-Based"
+                print(f"\n[BLOCKED] {ml_status} {analysis_result['attack_type']} detected")
+                print(f"  URL: {request_data['url']}")
+                print(f"  Threat Score: {analysis_result['threat_score']:.2f}")
+                
+                return jsonify({
+                    'error': 'Request Blocked',
+                    'message': f'Potential {analysis_result["attack_type"]} detected',
+                    'blocked': True,
+                    'threat_score': analysis_result['threat_score'],
+                    'attack_type': analysis_result['attack_type'],
+                    'ml_powered': self.ml_available
+                }), 403
+            else:
+                self.allowed_count += 1
+                print(f"\n[ALLOWED] {request_data['method']} {request_data['path']} - Score: {analysis_result['threat_score']:.2f}")
+                return None  # Allow request to proceed
+                
+        except Exception as e:
+            print(f"[ERROR] WAF Interceptor failed: {str(e)}")
+            traceback.print_exc()
+            # Fail open: allow request but log error
+            return None
+    
+    def get_statistics(self):
+        """
+        Get current WAF statistics
+        
+        Returns:
+            dict: Statistics including blocked and allowed counts
+        """
+        total = self.blocked_count + self.allowed_count
+        stats = {
+            'total_requests': total,
+            'blocked_requests': self.blocked_count,
+            'allowed_requests': self.allowed_count,
+            'block_rate': (self.blocked_count / total * 100) if total > 0 else 0,
+            'ml_powered': self.ml_available,
+            'db_connected': self.db_available
+        }
+        
+        # Get database statistics if available
+        if self.db_available:
+            try:
+                db_stats = db_ops.get_statistics()
+                stats.update(db_stats)
+            except:
+                pass
+        
+        return stats
+
+
+# Global WAF instance
+waf = WAFInterceptor(threshold=0.7)
+
+
+def waf_middleware():
+    """
+    Flask before_request middleware function
+    This is called automatically before every request
+    """
+    # Skip WAF for certain paths (optional)
+    if request.path.startswith('/api/admin') or request.path.startswith('/static'):
+        return None
+    
+    # Apply WAF interception
+    result = waf.intercept(request)
+    
+    # If result is not None, request is blocked
+    return result
+
+
+def require_waf_protection(f):
+    """
+    Decorator to apply WAF protection to specific routes
+    
+    Usage:
+        @app.route('/protected')
+        @require_waf_protection
+        def protected_route():
+            return "This route is protected"
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        result = waf.intercept(request)
+        if result is not None:
+            return result
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# Export functions
+__all__ = ['waf_middleware', 'require_waf_protection', 'waf', 'WAFInterceptor']
